@@ -15,7 +15,7 @@ As in previous assignments, we use `uv` to manage dependencies.
 1. Install all packages except `flash-attn`, then all packages (`flash-attn` is weird)
 ```
 uv sync --no-install-package flash-attn
-uv sync
+uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.1.post1/flash_attn-2.7.1.post1+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 ```
 
 2. Run unit tests:
