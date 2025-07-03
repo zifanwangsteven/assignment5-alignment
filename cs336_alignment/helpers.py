@@ -1,7 +1,14 @@
+import os
+import json
 import torch
-from typing import List
-from transformers import PreTrainedTokenizer
-
+from tqdm import tqdm
+import collections
+from typing import List, Callable
+from transformers import PreTrainedTokenizer, PreTrainedModel
+from vllm import LLM, SamplingParams
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
+from unittest.mock import patch
 
 def tokenize_prompt_and_output(prompt_strs:List[str], 
                                output_strs:List[str], 
@@ -44,3 +51,191 @@ def tokenize_prompt_and_output(prompt_strs:List[str],
         "labels": labels,
         "response_mask": response_mask
     }
+
+def compute_entropy(logits:torch.Tensor) -> torch.Tensor:
+    """
+    Compute the entropy of the logits.
+    Args:
+        logits: torch.Tensor, shape (batch_size, seq_len, num_tokens)
+    Returns:
+        torch.Tensor, shape (batch_size, seq_len)
+    """
+    log_probs = torch.log_softmax(logits, dim=-1)
+    return -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
+
+def get_response_log_probs(
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    return_token_entropy: bool = False,
+) -> dict[str, torch.Tensor]:
+    """
+    Args:
+        model: PreTrainedModel HuggingFace model used for scoring (placed on the correct device
+        and in inference mode if gradients should not be computed).
+        input_ids: torch.Tensor shape (batch_size, sequence_length), concatenated prompt +
+        response tokens as produced by your tokenization method.
+        labels: torch.Tensor shape (batch_size, sequence_length), labels as produced by your
+        tokenization method.
+        return_token_entropy: bool If True, also return per-token entropy by calling
+        compute_entropy.
+    Returns:
+        dict[str, torch.Tensor].
+        "log_probs" shape (batch_size, sequence_length), conditional log-probabilities
+        log pθ(xt |x<t).
+        "token_entropy" optional, shape (batch_size, sequence_length), per-token entropy
+        for each position (present only if return_token_entropy=True).
+    """
+    output = model(input_ids)
+    logits = output.logits
+    log_probs = torch.log_softmax(logits, dim=-1) # (batch_size, seq_len, vocab_size)
+    idx = labels.unsqueeze(-1)
+    conditional_log_probs = torch.gather(log_probs, dim=-1, index=idx).squeeze(-1) # (batch_size, seq_len)
+    if return_token_entropy:
+        token_entropy = compute_entropy(logits)
+        return {"log_probs": conditional_log_probs, "token_entropy": token_entropy}
+    else:
+        return {"log_probs": conditional_log_probs}
+    
+
+def masked_normalize(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    normalize_constant: float,
+    dim: int | None = None,
+) -> torch.Tensor:
+    processed_tensor = tensor * mask
+    sum = torch.sum(processed_tensor, dim=dim)
+    return sum / normalize_constant
+
+def evaluate_vllm(
+        evaluate_model:LLM,
+        reward_fn:Callable[[str, str], dict[str, float]],
+        prompts:List[str],
+        answers:List[str],
+        eval_sampling_params:SamplingParams,
+        save_dir:str=None
+) -> List[dict]:
+    """
+    Evaluate a language model on a list of prompts,
+    compute evaluation metrics, and serialize results to disk.
+    """
+    results = []
+    # Use tqdm for a progress bar
+    outputs = evaluate_model.generate(prompts=prompts, sampling_params=eval_sampling_params)
+    
+    print("Evaluating model outputs...")
+    for output, prompt, answer in tqdm(zip(outputs, prompts, answers), total=len(prompts)):
+        response = output.outputs[0].text
+        # Correctly call the reward function with the model's response and the ground truth answer
+        reward = reward_fn(response, answer)
+        results.append(
+            {
+                "prompt": prompt,
+                "response": response,
+                "ground_truth": answer,
+                "format_reward": reward["format_reward"],
+                "answer_reward": reward["answer_reward"],
+                "reward": reward["reward"]
+            }
+        )
+
+    if save_dir is not None:
+        save_path = os.path.join(save_dir, "MATH_results.json")
+        if not os.path.exists(os.path.dirname(save_path)):
+            os.makedirs(os.path.dirname(save_path))
+        with open(save_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Results saved to {save_path}")
+
+    return results
+
+
+def log_generations(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    llm: LLM,
+    step: int,
+    prompts: List[str],
+    answers: List[str],
+    eval_sampling_params: SamplingParams,
+    train_device: torch.device,
+    save_dir: str = None,
+) -> List[dict]:
+    """
+    Log generations from a model and save to disk.
+    """
+
+    eval_results = evaluate_vllm(
+        evaluate_model=llm,
+        reward_fn=r1_zero_reward_fn,
+        prompts=prompts,
+        answers=answers,
+        eval_sampling_params=eval_sampling_params,
+        save_dir=save_dir,            
+    )
+    prompts = [result["prompt"] for result in eval_results]
+    outputs = [result["response"] for result in eval_results]
+    format_rewards = [result["format_reward"] for result in eval_results]
+    answer_rewards = [result["answer_reward"] for result in eval_results]
+    rewards = [result["reward"] for result in eval_results]
+    ground_truths = [result["ground_truth"] for result in eval_results]
+
+    tokenized_results = tokenize_prompt_and_output(prompts, outputs, tokenizer, train_device)
+    log_probs = get_response_log_probs(model, tokenized_results["input_ids"], tokenized_results["labels"], return_token_entropy=True)
+    
+    avg_token_entropy = 1.0/torch.sum(tokenized_results["response_mask"]) * masked_normalize(log_probs["token_entropy"], tokenized_results["response_mask"], normalize_constant=1.0, dim=None)  
+    response_lens = tokenized_results["response_mask"].sum(dim=-1) # (batch_size, seq_len) -> (batch_size,)
+    avg_response_len = response_lens.float().mean() # (batch_size,) -> (1,)
+    correct_lens = response_lens[eval_results["reward"] > 0] # (B,) -> (b,)
+    avg_correct_len = correct_lens.float().mean() # (b,) -> (1,)
+    incorrect_lens = response_lens[eval_results["reward"] <= 0] # (B,) -> (b,)
+    avg_incorrect_len = incorrect_lens.float().mean() # (b,) -> (1,)
+    
+    format_accuracy = sum(format_rewards) / len(format_rewards)
+    answer_accuracy = sum(answer_rewards) / len(answer_rewards)
+    accuracy = sum(rewards) / len(rewards)
+
+    return {
+        "step": step,
+        "prompts": prompts,
+        "outputs": outputs,
+        "ground_truths": ground_truths,
+        "format_rewards": format_rewards,
+        "answer_rewards": answer_rewards,
+        "rewards": rewards,
+        "format_accuracy": format_accuracy,
+        "answer_accuracy": answer_accuracy,
+        "accuracy": accuracy,
+        "avg_token_entropy": avg_token_entropy,
+        "avg_response_len": avg_response_len,
+        "avg_correct_len": avg_correct_len,
+        "avg_incorrect_len": avg_incorrect_len,
+    }
+
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float=0.85):
+    vllm_set_random_seed(seed)
+    # patch: patch 是 Python 标准库 unittest.mock 里的一个工具，用来临时“打补丁”（monkey-patch）替换某个对象或函数的实现，常用形式有装饰器或上下文管理器。
+    # world_size_patch：把所有对 torch.distributed.get_world_size() 的调用都“骗”成返回 1，即告诉 vLLM 当前只在单卡环境下跑，不要启动多进程通信。
+    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+
+    # profiling_patch：把所有对 vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling 的调用都“骗”成返回 None，即告诉 vLLM 当前没有在 profiling 模式下跑，不要启动多进程通信。
+    profiling_patch = patch("vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None)
+    
+    with world_size_patch, profiling_patch:
+        llm = LLM(
+            model=model_id,
+            device=device,
+            dtype=torch.bfloat16,
+            enable_prefix_caching=True,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+        return llm
+    
+def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
+    state_dict = policy.state_dict()
+    # 获取 vLLM 的模型实例
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    
+    # 加载策略模型的权重到 vLLM 的模型实例中
+    llm_model.load_weights(state_dict.items())

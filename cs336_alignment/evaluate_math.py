@@ -7,48 +7,7 @@ from tqdm import tqdm
 from vllm import LLM, SamplingParams
 from typing import Callable, List
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-
-def evaluate_vllm(
-        evaluate_model:LLM,
-        reward_fn:Callable[[str, str], dict[str, float]],
-        prompts:List[str],
-        answers:List[str],
-        eval_sampling_params:SamplingParams,
-        save_dir:str=None
-) -> List[dict]:
-    """
-    Evaluate a language model on a list of prompts,
-    compute evaluation metrics, and serialize results to disk.
-    """
-    results = []
-    # Use tqdm for a progress bar
-    outputs = evaluate_model.generate(prompts=prompts, sampling_params=eval_sampling_params)
-    
-    print("Evaluating model outputs...")
-    for output, prompt, answer in tqdm(zip(outputs, prompts, answers), total=len(prompts)):
-        response = output.outputs[0].text
-        # Correctly call the reward function with the model's response and the ground truth answer
-        reward = reward_fn(response, answer)
-        results.append(
-            {
-                "prompt": prompt,
-                "response": response,
-                "ground_truth": answer,
-                "format_reward": reward["format_reward"],
-                "answer_reward": reward["answer_reward"],
-                "reward": reward["reward"]
-            }
-        )
-
-    if save_dir is not None:
-        save_path = os.path.join(save_dir, "MATH_results.json")
-        if not os.path.exists(os.path.dirname(save_path)):
-            os.makedirs(os.path.dirname(save_path))
-        with open(save_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"Results saved to {save_path}")
-
-    return results
+from cs336_alignment.helpers import evaluate_vllm
 
 def compute_metrics(results: List[dict], save_dir: str = None):
     """
