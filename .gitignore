@@ -1,5 +1,7 @@
 *.bin
 models/
+checkpoints/
+logs/
 
 nav
 tags

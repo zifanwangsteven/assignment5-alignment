@@ -4,7 +4,7 @@ import os
 import argparse
 import json
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW, get_scheduler
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from torch.utils.data import DataLoader, Dataset
 from cs336_alignment.helpers import (
     tokenize_prompt_and_output, 
@@ -15,6 +15,8 @@ from cs336_alignment.helpers import (
     load_policy_into_vllm_instance
 )
 from vllm import SamplingParams
+from cs336_alignment.evaluate_math import load_MATH
+import wandb
 
 def sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -59,22 +61,33 @@ class MATH_SFT_Dataset(Dataset):
 def collate_fn(batch):
     prompts = [item['prompt'] for item in batch]
     outputs = [item['response'] for item in batch]
-    answers = [item['answer'] for item in batch]
+    answers = [item['ground_truth'] for item in batch]
     return prompts, outputs, answers
 
 def train_sft(configs):
+
+    # wandb.init(
+    #     # Set the wandb entity where your project will be logged (generally your team name).
+    #     entity="hiro_xrl",
+    #     # Set the wandb project where this run will be logged.
+    #     project="MATH-SFT",
+    #     # Track hyperparameters and run metadata.
+    #     config=configs,
+    # )
+
     # Set seed for reproducibility
     torch.manual_seed(configs.seed)
     
     # Setup device
     train_device = torch.device(configs.train_device)
-    print(f"Using device: {train_device}")
+    print(f"Using training device: {train_device}")
 
     # Load model and tokenizer
     print("Loading model and tokenizer...")
     model = AutoModelForCausalLM.from_pretrained(
         configs.model_path,
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2"
     ).to(train_device)
 
     tokenizer = AutoTokenizer.from_pretrained(configs.model_path)
@@ -84,20 +97,21 @@ def train_sft(configs):
     # Load datasets
     print("Loading datasets...")
     train_dataset = MATH_SFT_Dataset(configs.data_train_path)
-    eval_dataset = MATH_SFT_Dataset(configs.data_eval_path)
+    eval_questions, eval_answers = load_MATH(configs.data_eval_path)
 
     micro_batch_size = configs.batch_size // configs.gradient_accumulation_steps
     train_dataloader = DataLoader(train_dataset, batch_size=micro_batch_size, shuffle=True, collate_fn=collate_fn)
-    
-    # For evaluation, we can use a larger batch size as there are no gradients
-    eval_prompts = [item['prompt'] for item in eval_dataset]
-    eval_answers = [item['output'] for item in eval_dataset]
+    train_data_size = len(train_dataset)
+    with open(configs.prompt_template_path, "r") as f:
+        prompt_template = f.read()
+    eval_prompts = [prompt_template.format(question=question) for question in eval_questions]
+    eval_answers = eval_answers
 
     # Setup optimizer and scheduler
     optimizer = AdamW(model.parameters(), lr=configs.lr)
     num_training_steps = configs.num_epochs * len(train_dataloader)
     lr_scheduler = get_scheduler(
-        name="cosine", optimizer=optimizer, num_warmup_steps=0.1*num_training_steps, num_training_steps=num_training_steps
+        name="cosine", optimizer=optimizer, num_warmup_steps=0.05*num_training_steps, num_training_steps=num_training_steps
     )
     
     # Initialize vLLM for evaluation
@@ -106,12 +120,11 @@ def train_sft(configs):
 
     # Training loop
     print("Starting training...")
-    global_step = 0
     for epoch in range(configs.num_epochs):
         model.train()
         flag = False
-        for i, (prompts, outputs, answers) in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}")):
-            flag = False
+        accumulated_loss = 0.0
+        for micro_step, (prompts, outputs, answers) in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}")):
             # Tokenize batch
             tokenized_batch = tokenize_prompt_and_output(prompts, outputs, tokenizer, train_device)
             input_ids = tokenized_batch['input_ids']
@@ -129,7 +142,9 @@ def train_sft(configs):
                 gradient_accumulation_steps=configs.gradient_accumulation_steps,
             )
 
-            if (i + 1) % configs.gradient_accumulation_steps == 0:
+            accumulated_loss += loss.item()
+
+            if (micro_step + 1) % configs.gradient_accumulation_steps == 0:
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
@@ -137,10 +152,11 @@ def train_sft(configs):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-                global_step += 1
                 flag = True
-                # Log loss
-                print(f"Epoch {epoch+1}, Step {global_step}, Loss: {loss.item() * configs.gradient_accumulation_steps}")
+
+                print(f"Step {epoch*train_data_size + micro_step*micro_batch_size}, Training loss = {accumulated_loss}", flush=True)
+                # wandb.log({"train/loss": loss.item()}, step=epoch*train_data_size + micro_step*micro_batch_size)
+                accumulated_loss = 0.0
 
         if flag == False:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -148,10 +164,11 @@ def train_sft(configs):
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-            global_step += 1
             flag = True
-            # Log loss
-            print(f"Epoch {epoch+1}, Step {global_step}, Loss: {loss.item() * configs.gradient_accumulation_steps}")
+            print(f"Step {epoch*train_data_size + micro_step*micro_batch_size}, Training loss = {accumulated_loss}", flush=True)
+            # wandb.log({"train/loss": loss.item()}, step=epoch*train_data_size + micro_step*micro_batch_size)
+            accumulated_loss = 0.0
+    
         # Evaluation at the end of each epoch
         print(f"\nRunning evaluation at end of epoch {epoch+1}...")
         model.eval()
@@ -165,15 +182,24 @@ def train_sft(configs):
             model=model,
             tokenizer=tokenizer,
             llm=llm_eval,
-            step=global_step,
+            step=epoch*train_data_size + micro_step*micro_batch_size,
             prompts=eval_prompts,
             answers=eval_answers,
             eval_sampling_params=eval_sampling_params,
             train_device=train_device,
-            save_dir=configs.save_dir
+            log_dir=configs.log_dir
         )
         
-        print(f"Epoch {epoch+1} Evaluation Accuracy: {eval_results['accuracy']:.4f}")
+        print(f"Step {epoch*train_data_size + micro_step*micro_batch_size}, Evaluation Accuracy: {eval_results['accuracy']:.4f}, Avg Response Len: {eval_results['avg_response_len']:.4f}")
+        wandb.log({"eval/accuracy": eval_results['accuracy'], 
+                   "eval/format_accuracy": eval_results['format_accuracy'], 
+                   "eval/answer_accuracy": eval_results['answer_accuracy'], 
+                   "eval/avg_response_len": eval_results['avg_response_len'], 
+                   "eval/avg_correct_len": eval_results['avg_correct_len'], 
+                   "eval/avg_incorrect_len": eval_results['avg_incorrect_len']}, 
+                   step=epoch*train_data_size + micro_step*micro_batch_size)
+
+
 
         # Save model checkpoint at the end of each epoch
         if configs.save_dir:
@@ -184,18 +210,19 @@ def train_sft(configs):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train a model with Supervised Fine-Tuning")
-    parser.add_argument('--model_path', type=str, required=True, help='Path to the pretrained model.')
-    parser.add_argument('--data_train_path', type=str, required=True, help='Path to the training data JSONL file.')
-    parser.add_argument('--data_eval_path', type=str, required=True, help='Path to the evaluation data JSONL file.')
+    parser.add_argument('--model_path', type=str, default="models/Qwen2.5-Math-1.5B", help='Path to the pretrained model.')
+    parser.add_argument('--data_train_path', type=str, default="data/MATH/sft.jsonl", help='Path to the training data JSONL file.')
+    parser.add_argument('--data_eval_path', type=str, default="data/MATH/validation.jsonl", help='Path to the evaluation data JSONL file.')
+    parser.add_argument('--prompt_template_path', type=str, default="cs336_alignment/prompts/r1_zero.prompt", help='Path to the prompt template file.')
     parser.add_argument('--train_device', type=str, default="cuda:0", help='Device to train on.')
     parser.add_argument('--eval_device', type=str, default="cuda:1", help='Device to evaluate on.')
-    parser.add_argument('--save_dir', type=str, default=None, help='Directory to save checkpoints and final model.')
+    parser.add_argument('--save_dir', type=str, default="checkpoints", help='Directory to save checkpoints and final model.')
+    parser.add_argument('--log_dir', type=str, default="logs", help='Directory to save logs.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed.')
     parser.add_argument('--lr', type=float, default=1e-5, help='Learning rate.')
     parser.add_argument('--batch_size', type=int, default=16, help='Total batch size for each optimization step.')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='Number of steps to accumulate gradients over.')
     parser.add_argument('--num_epochs', type=int, default=1, help='Number of training epochs.')
-
     configs = parser.parse_args()
     
     train_sft(configs)

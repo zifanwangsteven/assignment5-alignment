@@ -160,41 +160,90 @@ def log_generations(
     answers: List[str],
     eval_sampling_params: SamplingParams,
     train_device: torch.device,
-    save_dir: str = None,
+    log_dir: str = None,
+    eval_batch_size: int = 6,
 ) -> List[dict]:
     """
     Log generations from a model and save to disk.
     """
 
-    eval_results = evaluate_vllm(
+    base_results = evaluate_vllm(
         evaluate_model=llm,
         reward_fn=r1_zero_reward_fn,
         prompts=prompts,
         answers=answers,
         eval_sampling_params=eval_sampling_params,
-        save_dir=save_dir,            
+        save_dir=log_dir,            
     )
-    prompts = [result["prompt"] for result in eval_results]
-    outputs = [result["response"] for result in eval_results]
-    format_rewards = [result["format_reward"] for result in eval_results]
-    answer_rewards = [result["answer_reward"] for result in eval_results]
-    rewards = [result["reward"] for result in eval_results]
-    ground_truths = [result["ground_truth"] for result in eval_results]
+    prompts = [result["prompt"] for result in base_results]
+    outputs = [result["response"] for result in base_results]
+    format_rewards = [result["format_reward"] for result in base_results]
+    answer_rewards = [result["answer_reward"] for result in base_results]
+    rewards = [result["reward"] for result in base_results]
+    ground_truths = [result["ground_truth"] for result in base_results]
 
     tokenized_results = tokenize_prompt_and_output(prompts, outputs, tokenizer, train_device)
-    log_probs = get_response_log_probs(model, tokenized_results["input_ids"], tokenized_results["labels"], return_token_entropy=True)
     
+    # Batch process the log_prob calculation to avoid OOM
+    log_probs = []
+    token_entropies = []
+    
+    for i in tqdm(range(0, len(prompts), eval_batch_size)):
+        batch_input_ids = tokenized_results["input_ids"][i:i + eval_batch_size]
+        batch_labels = tokenized_results["labels"][i:i + eval_batch_size]
+        
+        with torch.no_grad():
+            log_probs_batch = get_response_log_probs(
+                model, 
+                batch_input_ids, 
+                batch_labels, 
+                return_token_entropy=True
+            )
+        log_probs.append(log_probs_batch["log_probs"])
+        token_entropies.append(log_probs_batch["token_entropy"])
+
+    final_log_probs = torch.cat(log_probs, dim=0).to(train_device)
+    final_token_entropy = torch.cat(token_entropies, dim=0).to(train_device)
+    
+    log_probs = {"log_probs": final_log_probs, "token_entropy": final_token_entropy}
+    rewards_tensor = torch.tensor(rewards, device=train_device)
+    rewards_positive_mask = rewards_tensor > 0
+    rewards_negative_mask = rewards_tensor <= 0
+
     avg_token_entropy = 1.0/torch.sum(tokenized_results["response_mask"]) * masked_normalize(log_probs["token_entropy"], tokenized_results["response_mask"], normalize_constant=1.0, dim=None)  
     response_lens = tokenized_results["response_mask"].sum(dim=-1) # (batch_size, seq_len) -> (batch_size,)
     avg_response_len = response_lens.float().mean() # (batch_size,) -> (1,)
-    correct_lens = response_lens[eval_results["reward"] > 0] # (B,) -> (b,)
+    correct_lens = response_lens[rewards_positive_mask] # (B,) -> (b,)
     avg_correct_len = correct_lens.float().mean() # (b,) -> (1,)
-    incorrect_lens = response_lens[eval_results["reward"] <= 0] # (B,) -> (b,)
+    incorrect_lens = response_lens[rewards_negative_mask] # (B,) -> (b,)
     avg_incorrect_len = incorrect_lens.float().mean() # (b,) -> (1,)
     
     format_accuracy = sum(format_rewards) / len(format_rewards)
     answer_accuracy = sum(answer_rewards) / len(answer_rewards)
     accuracy = sum(rewards) / len(rewards)
+    
+    if log_dir is not None:
+        save_path = os.path.join(log_dir, f"step_{step}.json")
+        if not os.path.exists(os.path.dirname(save_path)):
+            os.makedirs(os.path.dirname(save_path))
+        
+        # Prepare the full results dictionary for saving
+        full_results_to_save = {
+            "step": step,
+            "metrics": {
+                "format_accuracy": format_accuracy,
+                "answer_accuracy": answer_accuracy,
+                "accuracy": accuracy,
+                "avg_token_entropy": avg_token_entropy.item(),
+                "avg_response_len": avg_response_len.item(),
+                "avg_correct_len": avg_correct_len.item(),
+                "avg_incorrect_len": avg_incorrect_len.item(),
+            },
+        }
+
+        with open(save_path, 'w') as f:
+            json.dump(full_results_to_save, f, indent=2)
+        print(f"Results saved to {save_path}")
 
     return {
         "step": step,
@@ -215,11 +264,11 @@ def log_generations(
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float=0.85):
     vllm_set_random_seed(seed)
-    # patch: patch 是 Python 标准库 unittest.mock 里的一个工具，用来临时“打补丁”（monkey-patch）替换某个对象或函数的实现，常用形式有装饰器或上下文管理器。
-    # world_size_patch：把所有对 torch.distributed.get_world_size() 的调用都“骗”成返回 1，即告诉 vLLM 当前只在单卡环境下跑，不要启动多进程通信。
+    # patch: patch 是 Python 标准库 unittest.mock 里的一个工具，用来临时"打补丁"（monkey-patch）替换某个对象或函数的实现，常用形式有装饰器或上下文管理器。
+    # world_size_patch：把所有对 torch.distributed.get_world_size() 的调用都"骗"成返回 1，即告诉 vLLM 当前只在单卡环境下跑，不要启动多进程通信。
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
 
-    # profiling_patch：把所有对 vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling 的调用都“骗”成返回 None，即告诉 vLLM 当前没有在 profiling 模式下跑，不要启动多进程通信。
+    # profiling_patch：把所有对 vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling 的调用都"骗"成返回 None，即告诉 vLLM 当前没有在 profiling 模式下跑，不要启动多进程通信。
     profiling_patch = patch("vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None)
     
     with world_size_patch, profiling_patch:
