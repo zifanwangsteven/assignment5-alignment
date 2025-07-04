@@ -97,12 +97,34 @@ def load_MATH(data_path="data/MATH/validation.jsonl"):
     print(f"Loaded {len(questions)} questions and {len(answers)} answers")
     return questions, answers
 
+def load_gsm8k(data_path="data/gsm8k/test.jsonl"):
+    """
+    Load GSM-8K test dataset problems and solutions from JSON files.
+    """
+    questions = []
+    answers = []
+
+    with open(data_path, 'r', encoding='utf-8') as f:
+        for line in tqdm(f, desc="Loading GSM-8K test data"):
+            data = json.loads(line)
+            if 'question' in data and 'ground_truth' in data:
+                questions.append(data['question'])
+                answers.append(data['ground_truth'])
+            else:
+                print(f"Warning: Missing 'question' or 'answer' in {data_path}")
+    print(f"Loaded {len(questions)} questions and {len(answers)} answers")
+    return questions, answers
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="models/Qwen2.5-Math-1.5B")
+    parser.add_argument("--dataset", type=str, default="MATH", choices=["MATH", "gsm8k"])
     parser.add_argument("--MATH_data_path", type=str, default="./data/MATH/validation.jsonl")
-    parser.add_argument("--prompt_template_path", type=str, default="cs336_alignment/prompts/r1_zero.prompt")
-    parser.add_argument("--save_dir", type=str, default="results", help="Directory to save evaluation results and analysis")
+    parser.add_argument("--gsm8k_data_path", type=str, default="./data/gsm8k/test_processed.jsonl")
+    parser.add_argument("--r1_zero_prompt_template_path", type=str, default="cs336_alignment/prompts/r1_zero.prompt")
+    parser.add_argument("--question_only_prompt_template_path", type=str, default="cs336_alignment/prompts/question_only.prompt")
+    parser.add_argument("--reward_type", type=str, default="r1_zero", choices=["r1_zero", "question_only"])
+    parser.add_argument("--save_dir", type=str, default="baseline_results", help="Directory to save evaluation results and analysis")
     args = parser.parse_args()
 
 
@@ -119,16 +141,31 @@ if __name__ == "__main__":
         include_stop_str_in_output=True
     )
     
-    questions, answers = load_MATH(args.MATH_data_path)
+    if args.dataset == "MATH":
+        questions, answers = load_MATH(args.MATH_data_path)
+    elif args.dataset == "gsm8k":
+        questions, answers = load_gsm8k(args.gsm8k_data_path)
+    else:
+        raise ValueError(f"Invalid dataset: {args.dataset}")
 
-    with open(args.prompt_template_path, "r") as f:
+    if args.reward_type == "r1_zero":
+        reward_fn = r1_zero_reward_fn
+        prompt_template_path = args.r1_zero_prompt_template_path
+    elif args.reward_type == "question_only":
+        reward_fn = question_only_reward_fn
+        prompt_template_path = args.question_only_prompt_template_path
+    else:
+        raise ValueError(f"Invalid reward type: {args.reward_type}")
+    
+    with open(prompt_template_path, "r") as f:
         prompt_template = f.read()
     prompts = [prompt_template.format(question=question) for question in questions]
 
+    
     print("Evaluating model...")
     results = evaluate_vllm(
         evaluate_model=model,
-        reward_fn=question_only_reward_fn,
+        reward_fn=reward_fn,
         prompts=prompts,
         answers=answers,
         eval_sampling_params=eval_sampling_params,
