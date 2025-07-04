@@ -114,6 +114,7 @@ def evaluate_vllm(
         prompts:List[str],
         answers:List[str],
         eval_sampling_params:SamplingParams,
+        step:int=0,
         save_dir:str=None
 ) -> List[dict]:
     """
@@ -141,7 +142,7 @@ def evaluate_vllm(
         )
 
     if save_dir is not None:
-        save_path = os.path.join(save_dir, "MATH_results.json")
+        save_path = os.path.join(save_dir, f"eval_generations_step_{step}.json")
         if not os.path.exists(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
         with open(save_path, 'w') as f:
@@ -172,6 +173,7 @@ def log_generations(
         reward_fn=r1_zero_reward_fn,
         prompts=prompts,
         answers=answers,
+        step=step,
         eval_sampling_params=eval_sampling_params,
         save_dir=log_dir,            
     )
@@ -223,7 +225,7 @@ def log_generations(
     accuracy = sum(rewards) / len(rewards)
     
     if log_dir is not None:
-        save_path = os.path.join(log_dir, f"step_{step}.json")
+        save_path = os.path.join(log_dir, f"eval_metrics_step_{step}.json")
         if not os.path.exists(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
         

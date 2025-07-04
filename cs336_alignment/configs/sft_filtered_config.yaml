@@ -1,0 +1,16 @@
+model_path: "models/Qwen2.5-Math-1.5B"
+data_train_path: "data/MATH/sft_filtered.jsonl"
+data_eval_path: "data/MATH/validation.jsonl"
+prompt_template_path: "cs336_alignment/prompts/r1_zero.prompt"
+train_device: "cuda:0"
+eval_device: "cuda:1"
+save_dir: "checkpoints"
+log_dir: "logs"
+seed: 42
+lr_scheduler: "cosine_with_min_lr"
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+lr: 4.0e-5
+batch_size: 16
+gradient_accumulation_steps: 4
+num_epochs: 5

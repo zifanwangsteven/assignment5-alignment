@@ -6,8 +6,8 @@ import argparse
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 from typing import Callable, List
-from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.helpers import evaluate_vllm
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
+from cs336_alignment.helpers import evaluate_vllm, init_vllm
 
 def compute_metrics(results: List[dict], save_dir: str = None):
     """
@@ -83,7 +83,7 @@ def load_MATH(data_path="data/MATH/validation.jsonl"):
     answers = []
 
     with open(data_path, 'r', encoding='utf-8') as f:
-        for line in tqdm(f, desc="Loading MATH data"):
+        for line in tqdm(f, desc="Loading MATH eval data"):
             try:
                 data = json.loads(line)
                 if 'problem' in data and 'answer' in data:
@@ -107,10 +107,7 @@ if __name__ == "__main__":
 
 
     print("Loading model...")
-    model = LLM(
-        model=args.model,
-        tensor_parallel_size=torch.cuda.device_count(),
-    )
+    model = init_vllm(model_id=args.model, device="cuda:0", seed=42)
     print("Model loaded.")
 
     
@@ -131,11 +128,12 @@ if __name__ == "__main__":
     print("Evaluating model...")
     results = evaluate_vllm(
         evaluate_model=model,
-        reward_fn=r1_zero_reward_fn,
+        reward_fn=question_only_reward_fn,
         prompts=prompts,
         answers=answers,
         eval_sampling_params=eval_sampling_params,
         save_dir=args.save_dir
     )
     metrics = compute_metrics(results, args.save_dir)
+    print(f"Accuracy: {metrics['accuracy']:.4f}")
     print("Evaluation complete.")

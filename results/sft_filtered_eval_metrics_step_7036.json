@@ -1,0 +1,12 @@
+{
+  "step": 7036,
+  "metrics": {
+    "format_accuracy": 0.9942,
+    "answer_accuracy": 0.502,
+    "accuracy": 0.502,
+    "avg_token_entropy": 0.2517963647842407,
+    "avg_response_len": 150.47079467773438,
+    "avg_correct_len": 125.93386840820312,
+    "avg_incorrect_len": 175.20481872558594
+  }
+}

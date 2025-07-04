@@ -17,6 +17,7 @@ from cs336_alignment.helpers import (
 from vllm import SamplingParams
 from cs336_alignment.evaluate_math import load_MATH
 import wandb
+from omegaconf import OmegaConf
 
 def sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -64,16 +65,17 @@ def collate_fn(batch):
     answers = [item['ground_truth'] for item in batch]
     return prompts, outputs, answers
 
+
 def train_sft(configs):
 
-    # wandb.init(
-    #     # Set the wandb entity where your project will be logged (generally your team name).
-    #     entity="hiro_xrl",
-    #     # Set the wandb project where this run will be logged.
-    #     project="MATH-SFT",
-    #     # Track hyperparameters and run metadata.
-    #     config=configs,
-    # )
+    wandb.init(
+        # Set the wandb entity where your project will be logged (generally your team name).
+        entity="hiro_xrl",
+        # Set the wandb project where this run will be logged.
+        project="MATH-SFT",
+        # Track hyperparameters and run metadata.
+        config=configs,
+    )
 
     # Set seed for reproducibility
     torch.manual_seed(configs.seed)
@@ -110,8 +112,11 @@ def train_sft(configs):
     # Setup optimizer and scheduler
     optimizer = AdamW(model.parameters(), lr=configs.lr)
     num_training_steps = configs.num_epochs * len(train_dataloader)
+    
+    lr_scheduler_kwargs = OmegaConf.to_container(configs.lr_scheduler_kwargs, resolve=True) if hasattr(configs, 'lr_scheduler_kwargs') else {}
+
     lr_scheduler = get_scheduler(
-        name="cosine", optimizer=optimizer, num_warmup_steps=0.05*num_training_steps, num_training_steps=num_training_steps
+        name=configs.lr_scheduler, optimizer=optimizer, num_warmup_steps=0.05*num_training_steps, num_training_steps=num_training_steps, scheduler_specific_kwargs=lr_scheduler_kwargs
     )
     
     # Initialize vLLM for evaluation
@@ -140,6 +145,7 @@ def train_sft(configs):
                 policy_log_probs=policy_log_probs,
                 response_mask=response_mask,
                 gradient_accumulation_steps=configs.gradient_accumulation_steps,
+                normalize_constant = response_mask.sum(dim=-1).float().mean()
             )
 
             accumulated_loss += loss.item()
@@ -155,7 +161,7 @@ def train_sft(configs):
                 flag = True
 
                 print(f"Step {epoch*train_data_size + micro_step*micro_batch_size}, Training loss = {accumulated_loss}", flush=True)
-                # wandb.log({"train/loss": loss.item()}, step=epoch*train_data_size + micro_step*micro_batch_size)
+                wandb.log({"train/loss": accumulated_loss}, step=epoch*train_data_size + micro_step*micro_batch_size)
                 accumulated_loss = 0.0
 
         if flag == False:
@@ -166,7 +172,7 @@ def train_sft(configs):
             optimizer.zero_grad()
             flag = True
             print(f"Step {epoch*train_data_size + micro_step*micro_batch_size}, Training loss = {accumulated_loss}", flush=True)
-            # wandb.log({"train/loss": loss.item()}, step=epoch*train_data_size + micro_step*micro_batch_size)
+            wandb.log({"train/loss": accumulated_loss}, step=epoch*train_data_size + micro_step*micro_batch_size)
             accumulated_loss = 0.0
     
         # Evaluation at the end of each epoch
@@ -199,8 +205,6 @@ def train_sft(configs):
                    "eval/avg_incorrect_len": eval_results['avg_incorrect_len']}, 
                    step=epoch*train_data_size + micro_step*micro_batch_size)
 
-
-
         # Save model checkpoint at the end of each epoch
         if configs.save_dir:
             epoch_save_path = os.path.join(configs.save_dir, f'checkpoint_epoch_{epoch+1}')
@@ -208,22 +212,12 @@ def train_sft(configs):
             model.save_pretrained(epoch_save_path)
             tokenizer.save_pretrained(epoch_save_path)
 
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train a model with Supervised Fine-Tuning")
-    parser.add_argument('--model_path', type=str, default="models/Qwen2.5-Math-1.5B", help='Path to the pretrained model.')
-    parser.add_argument('--data_train_path', type=str, default="data/MATH/sft.jsonl", help='Path to the training data JSONL file.')
-    parser.add_argument('--data_eval_path', type=str, default="data/MATH/validation.jsonl", help='Path to the evaluation data JSONL file.')
-    parser.add_argument('--prompt_template_path', type=str, default="cs336_alignment/prompts/r1_zero.prompt", help='Path to the prompt template file.')
-    parser.add_argument('--train_device', type=str, default="cuda:0", help='Device to train on.')
-    parser.add_argument('--eval_device', type=str, default="cuda:1", help='Device to evaluate on.')
-    parser.add_argument('--save_dir', type=str, default="checkpoints", help='Directory to save checkpoints and final model.')
-    parser.add_argument('--log_dir', type=str, default="logs", help='Directory to save logs.')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed.')
-    parser.add_argument('--lr', type=float, default=1e-5, help='Learning rate.')
-    parser.add_argument('--batch_size', type=int, default=16, help='Total batch size for each optimization step.')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='Number of steps to accumulate gradients over.')
-    parser.add_argument('--num_epochs', type=int, default=1, help='Number of training epochs.')
-    configs = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Train a model with Supervised Fine-Tuning from a config file.")
+    parser.add_argument('--config', type=str, default="cs336_alignment/configs/sft_config.yaml", help='Path to the YAML config file.')
+    args = parser.parse_args()
+    configs = OmegaConf.load(args.config)
     
     train_sft(configs)
 

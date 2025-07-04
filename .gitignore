@@ -2,6 +2,7 @@
 models/
 checkpoints/
 logs/
+wandb/
 
 nav
 tags
