@@ -3,7 +3,7 @@ import json
 import torch
 from tqdm import tqdm
 import collections
-from typing import List, Callable
+from typing import List, Callable, Literal
 from transformers import PreTrainedTokenizer, PreTrainedModel
 from vllm import LLM, SamplingParams
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
@@ -266,11 +266,11 @@ def log_generations(
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float=0.85):
     vllm_set_random_seed(seed)
-    # patch: patch 是 Python 标准库 unittest.mock 里的一个工具，用来临时"打补丁"（monkey-patch）替换某个对象或函数的实现，常用形式有装饰器或上下文管理器。
-    # world_size_patch：把所有对 torch.distributed.get_world_size() 的调用都"骗"成返回 1，即告诉 vLLM 当前只在单卡环境下跑，不要启动多进程通信。
+    # patch: patch is a tool in the Python standard library unittest.mock, used to temporarily "patch" (monkey-patch) the implementation of a specific object or function, commonly used as a decorator or context manager.
+    # world_size_patch: patch all calls to torch.distributed.get_world_size() to return 1, telling vLLM that it is currently running in a single-card environment and not to start multi-process communication.
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
 
-    # profiling_patch：把所有对 vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling 的调用都"骗"成返回 None，即告诉 vLLM 当前没有在 profiling 模式下跑，不要启动多进程通信。
+    # profiling_patch: patch all calls to vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling to return None, telling vLLM that it is currently not running in profiling mode and not to start multi-process communication.
     profiling_patch = patch("vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None)
     
     with world_size_patch, profiling_patch:
@@ -285,8 +285,151 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
     
 def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     state_dict = policy.state_dict()
-    # 获取 vLLM 的模型实例
+    # get the model instance of vLLM
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     
-    # 加载策略模型的权重到 vLLM 的模型实例中
+    # load the policy model weights into the vLLM model instance
     llm_model.load_weights(state_dict.items())
+
+
+def compute_group_normalized_rewards(
+        reward_fn:Callable[[str, str], dict[str, float]],
+        rollout_responses:List[str],
+        repeated_ground_truths:List[str],
+        group_size:int,
+        advantage_epsilon:float=1e-5,
+        normalize_std:bool=True,
+        device:torch.device=torch.device("cpu")
+) -> List[float]:
+        """
+        Compute rewards for each group of rollout responses, normalized by the group size.
+        Args:
+        reward_fn: Callable[[str, str], dict[str, float]] Scores the rollout responses against
+            the ground truths, producing a dict with keys "reward", "format_reward", and
+            "answer_reward".
+        rollout_responses: list[str] Rollouts from the policy. The length of this list is
+            rollout_batch_size = n_prompts_per_rollout_batch * group_size.
+        repeated_ground_truths: list[str] The ground truths for the examples. The length of this
+            list is rollout_batch_size, because the ground truth for each example is repeated
+            group_size times.
+        group_size: int Number of responses per question (group).
+        advantage_eps: float Small constant to avoid division by zero in normalization.
+        normalize_by_std: bool If True, divide by the per-group standard deviation; otherwise
+            subtract only the group mean.
+        Returns:
+        tuple[torch.Tensor, torch.Tensor, dict[str, float]].
+        advantages shape (rollout_batch_size,). Group-normalized rewards for each rollout
+            response.
+        raw_rewards shape (rollout_batch_size,). Unnormalized rewards for each rollout
+            response.
+        metadata your choice of other statistics to log (e.g. mean, std, max/min of rewards).
+        """
+        rewards = [reward_fn(rollout_response, ground_truth) for rollout_response, ground_truth in zip(rollout_responses, repeated_ground_truths)]
+        raw_rewards = [reward["reward"] for reward in rewards]
+        raw_rewards_tensor = torch.tensor(raw_rewards, device=device)
+        raw_rewards_tensor = raw_rewards_tensor.reshape(-1, group_size)
+        mean = raw_rewards_tensor.mean(dim=-1, keepdim=True)
+        std = raw_rewards_tensor.std(dim=-1, keepdim=True)
+        if normalize_std:
+            advantages = (raw_rewards_tensor - mean) / (std + advantage_epsilon)
+        else:
+            advantages = raw_rewards_tensor - mean
+        advantages = advantages.reshape(-1)
+        metadata = {}
+        return advantages, raw_rewards, metadata
+
+def compute_naive_policy_gradient_loss(
+        raw_rewards_or_advantages:torch.Tensor,
+        policy_log_probs:torch.Tensor,
+) -> torch.Tensor:  
+    """
+    Compute the naive policy gradient loss.
+    Args:
+        advantages: torch.Tensor Shape (batch_size, 1), scalar reward/advantage for each rollout response.
+        policy_log_probs: torch.Tensor Shape (batch_size, sequence_length), logprobs for
+        each token.
+    Returns:
+        torch.Tensor Shape (batch_size, sequence_length), the naive policy gradient loss.
+    """
+    return -raw_rewards_or_advantages * policy_log_probs
+
+def compute_grpo_clip_loss(
+        advantages:torch.Tensor,
+        policy_log_probs:torch.Tensor,
+        old_log_probs:torch.Tensor,
+        cliprange:float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    Args:
+        advantages: torch.Tensor Shape (batch_size, 1), scalar
+        policy_log_probs: torch.Tensor Shape (batch_size, sequence_length), logprobs for
+        each token.
+        old_log_probs: torch.Tensor Shape (batch_size, sequence_length), logprobs for
+        each token.
+        cliprange: float The clip range for the importance ratio.
+    Returns:
+        torch.Tensor Shape (batch_size, sequence_length), the GRPO-Clip loss.
+    """
+    importance_ratio = torch.exp(policy_log_probs - old_log_probs)
+    clipped_importance_ratio = torch.clamp(importance_ratio, 1 - cliprange, 1 + cliprange)
+    clipped_loss = clipped_importance_ratio * advantages
+    unclipped_loss = importance_ratio * advantages
+    loss = -torch.min(clipped_loss, unclipped_loss)
+    metadata = {"clipped": clipped_loss < unclipped_loss}
+    return loss, metadata
+
+def compute_policy_gradient_loss(
+    policy_log_probs: torch.Tensor,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    Select and compute the desired policy-gradient loss.
+
+    Args:
+      policy_log_probs (batch_size, sequence_length), per-token log-probabilities from the
+        policy being trained.
+      loss_type One of "no_baseline", "reinforce_with_baseline", or "grpo_clip".
+      raw_rewards Required if loss_type == "no_baseline"; shape (batch_size, 1).
+      advantages Required for "reinforce_with_baseline" and "grpo_clip"; shape
+        (batch_size, 1).
+      old_log_probs Required for "grpo_clip"; shape (batch_size, sequence_length).
+      cliprange Required for "grpo_clip"; scalar ε used for clipping.
+
+    Returns:
+      tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        loss (batch_size, sequence_length), per-token loss.
+        metadata dict, statistics from the underlying routine (e.g., clip fraction for GRPO-Clip).
+    """
+    metadata = {}
+    if loss_type == "no_baseline":
+        loss = compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs)
+    elif loss_type == "reinforce_with_baseline":
+        loss = compute_naive_policy_gradient_loss(advantages, policy_log_probs)
+    elif loss_type == "grpo_clip":
+        loss, metadata = compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+    else:
+        raise ValueError(f"Invalid loss type: {loss_type}")
+    return loss, metadata
+
+def masked_mean(
+    tensor: torch.Tensor, 
+    mask: torch.Tensor, 
+    dim: int | None = None,
+) -> torch.Tensor:
+    """
+    Compute the mean of the tensor along a dimension,
+    considering only the elements with mask value 1.
+    Args:
+        tensor: torch.Tensor, the tensor to compute the mean of.
+        mask: torch.Tensor, the mask. We only take the mean over the elements with mask value 1.
+        dim: int | None, the dimension to compute the mean over.
+    Returns:
+        torch.Tensor, the mean of the tensor along the dimension.
+    """
+    processed_tensor = tensor * mask
+    sum = torch.sum(processed_tensor, dim=dim)
+    return sum / mask.sum(dim=dim)
