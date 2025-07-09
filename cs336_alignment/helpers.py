@@ -111,6 +111,7 @@ def masked_normalize(
     return sum / normalize_constant
 
 def evaluate_vllm(
+        name: str,
         evaluate_model:LLM,
         reward_fn:Callable[[str, str], dict[str, float]],
         prompts:List[str],
@@ -144,7 +145,7 @@ def evaluate_vllm(
         )
 
     if save_dir is not None:
-        save_path = os.path.join(save_dir, f"eval_generations_step_{step}.json")
+        save_path = os.path.join(save_dir, f"{name}_eval_generations_step_{step}.json")
         if not os.path.exists(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
         with open(save_path, 'w') as f:
@@ -155,6 +156,7 @@ def evaluate_vllm(
 
 
 def log_generations(
+    name: str,
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     llm: LLM,
@@ -171,6 +173,7 @@ def log_generations(
     """
 
     base_results = evaluate_vllm(
+        name=name,
         evaluate_model=llm,
         reward_fn=r1_zero_reward_fn,
         prompts=prompts,
@@ -227,7 +230,7 @@ def log_generations(
     accuracy = sum(rewards) / len(rewards)
     
     if log_dir is not None:
-        save_path = os.path.join(log_dir, f"eval_metrics_step_{step}.json")
+        save_path = os.path.join(log_dir, f"{name}_eval_metrics_step_{step}.json")
         if not os.path.exists(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
         

@@ -7,7 +7,8 @@ from tqdm import tqdm
 from vllm import LLM, SamplingParams
 from typing import Callable, List
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
-from cs336_alignment.helpers import evaluate_vllm, init_vllm
+from cs336_alignment.helpers import evaluate_vllm, init_vllm, load_policy_into_vllm_instance
+from transformers import AutoModelForCausalLM
 
 def compute_metrics(results: List[dict], save_dir: str = None):
     """
@@ -129,7 +130,8 @@ if __name__ == "__main__":
 
 
     print("Loading model...")
-    model = init_vllm(model_id=args.model, device="cuda:0", seed=42)
+    vllm_model = init_vllm(model_id=args.model, device="cuda:1", seed=42, gpu_memory_utilization=0.75)
+    
     print("Model loaded.")
 
     
@@ -138,7 +140,7 @@ if __name__ == "__main__":
         top_p=1.0,
         max_tokens=1024,
         stop=["</answer>"],
-        include_stop_str_in_output=True
+        include_stop_str_in_output=True,
     )
     
     if args.dataset == "MATH":
@@ -164,7 +166,8 @@ if __name__ == "__main__":
     
     print("Evaluating model...")
     results = evaluate_vllm(
-        evaluate_model=model,
+        name="grpo_MATH",
+        evaluate_model=vllm_model,
         reward_fn=reward_fn,
         prompts=prompts,
         answers=answers,

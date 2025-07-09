@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler, HfArgumentParser
 from torch.optim import AdamW
 from vllm import LLM, SamplingParams
 from typing import Literal
@@ -21,6 +21,8 @@ from tqdm import tqdm
 import random
 import wandb
 import os
+from cs336_alignment.grpo_config import GRPOConfig
+from trl import TrlParser
 
 def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -59,35 +61,39 @@ def train_grpo(
         f"rollout_batch_size must be divisible by group_size")
     n_prompts_per_rollout_batch = configs.rollout_batch_size // configs.group_size
     
+    
     print("Loading model and tokenizer...")
     model = AutoModelForCausalLM.from_pretrained(configs.model_path, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2").to(train_device)
     tokenizer = AutoTokenizer.from_pretrained(configs.model_path)
 
+    
+    
     print(f"Initializing vLLM model on device: {configs.eval_device}")
     vllm_model = init_vllm(configs.model_path, configs.eval_device, configs.seed)
 
+    
     print("Loading train dataset and eval dataset...")
     train_dataset = []
-    with open(configs.train_dataset_path, "r") as file:
+    with open(configs.data_train_path, "r") as file:
         for line in file:
             train_dataset.append(json.loads(line))
 
-    train_questions, train_answers = [data["problem"] for data in train_dataset], [data["answer"] for data in train_dataset]
     eval_questions, eval_answers = load_MATH_eval(configs.data_eval_path)
-
+    eval_questions = eval_questions[:1000]
+    eval_answers = eval_answers[:1000]
     # Load prompt template
     with open(configs.prompt_template_path, "r") as f:
         prompt_template = f.read()
-
-    train_prompts = [prompt_template.format(question=question) for question in train_questions]
     eval_prompts = [prompt_template.format(question=question) for question in eval_questions]
     
+    num_training_steps = configs.n_grpo_steps * configs.n_grpo_iterations * rollout_batch_size // train_batch_size
     optimizer = AdamW(model.parameters(), lr=configs.lr, weight_decay=0.0, betas=(0.9, 0.95))
     lr_scheduler = get_scheduler(
-        "cosine",
-        optimizer,
-        num_warmup_steps=configs.num_warmup_steps,
-        num_training_steps=configs.n_grpo_steps * rollout_batch_size // train_batch_size * configs.n_grpo_iterations,
+        name=configs.lr_scheduler, 
+        optimizer=optimizer, 
+        num_warmup_steps=0.1*num_training_steps, 
+        num_training_steps=num_training_steps, 
+        scheduler_specific_kwargs=configs.lr_scheduler_kwargs
     )
     
     if configs.reward_type == "r1_zero":
@@ -98,17 +104,27 @@ def train_grpo(
         raise ValueError(f"Invalid reward type: {configs.reward_type}")
     
     off_policy = configs.n_grpo_iterations > 1
-    print("Starting GRPO training...")
+    print(f"Starting GRPO training with off-policy={off_policy}...")
+
+
     step = 0
-    for grpo_step in range(tqdm(configs.n_grpo_steps)):
-        sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True, n=configs.group_size, seed=configs.seed)
+    for grpo_step in tqdm(range(configs.n_grpo_steps), desc="GRPO steps"):
+        sampling_params = SamplingParams(temperature=1.0, 
+                                         top_p=1.0, 
+                                         min_tokens=4,
+                                         max_tokens=1024, 
+                                         stop=["</answer>"], 
+                                         include_stop_str_in_output=True, 
+                                         n=configs.group_size, 
+                                         seed=configs.seed,
+                                         )
         rollout_dataset = random.sample(train_dataset, n_prompts_per_rollout_batch)
         rollout_prompts = [prompt_template.format(question=data["problem"]) for data in rollout_dataset]
         rollout_answers = [data["answer"] for data in rollout_dataset]
 
         rollout_outputs = vllm_model.generate(rollout_prompts, sampling_params=sampling_params)
 
-        prompts=[ ]
+        prompts=[]
         responses=[]
         repeated_answers=[]
         for prompt, output, answer in zip(rollout_prompts, rollout_outputs, rollout_answers):
@@ -137,8 +153,8 @@ def train_grpo(
                     for train_microstep in range(gradient_accumulation_steps):
                         start_idx = train_step*train_batch_size + train_microstep*micro_train_batch_size
                         end_idx = start_idx + micro_train_batch_size
-                        input_ids, labels, response_mask = input_ids[start_idx:end_idx], labels[start_idx:end_idx], response_mask[start_idx:end_idx]
-                        log_probs_dict = get_response_log_probs(model, input_ids, labels, return_token_entropy=True)
+                        input_ids_micro, labels_micro, response_mask_micro = input_ids[start_idx:end_idx], labels[start_idx:end_idx], response_mask[start_idx:end_idx]
+                        log_probs_dict = get_response_log_probs(model, input_ids_micro, labels_micro, return_token_entropy=True)
                         log_probs, token_entropy = log_probs_dict["log_probs"], log_probs_dict["token_entropy"]
                         old_log_probs_train.append(log_probs)
                         assert log_probs.shape[0] == micro_train_batch_size
@@ -151,8 +167,8 @@ def train_grpo(
                 for train_microstep in range(gradient_accumulation_steps):
                     start_idx = train_step*train_batch_size + train_microstep*micro_train_batch_size
                     end_idx = start_idx + micro_train_batch_size
-                    input_ids, labels, response_mask = input_ids[start_idx:end_idx], labels[start_idx:end_idx], response_mask[start_idx:end_idx]
-                    log_probs_dict = get_response_log_probs(model, input_ids, labels, return_token_entropy=True)
+                    input_ids_micro, labels_micro, response_mask_micro = input_ids[start_idx:end_idx], labels[start_idx:end_idx], response_mask[start_idx:end_idx]
+                    log_probs_dict = get_response_log_probs(model, input_ids_micro, labels_micro, return_token_entropy=True)
                     policy_log_probs, token_entropy = log_probs_dict["log_probs"], log_probs_dict["token_entropy"]
                     
                     if off_policy:
@@ -162,11 +178,11 @@ def train_grpo(
                     
                     loss, metadata = grpo_microbatch_train_step(
                         policy_log_probs=policy_log_probs,
-                        response_mask=response_mask,
+                        response_mask=response_mask_micro,
                         gradient_accumulation_steps=gradient_accumulation_steps,
                         loss_type=configs.loss_type,
                         raw_rewards=raw_rewards[start_idx:end_idx],
-                        advantages=advantages[start_idx:end_idx],
+                        advantages=advantages[start_idx:end_idx].reshape(-1,1),
                         old_log_probs=use_old_log_probs,
                         cliprange=configs.cliprange
                     )
@@ -179,36 +195,50 @@ def train_grpo(
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-        model.eval()
-        # Load policy into vLLM instance
-        load_policy_into_vllm_instance(model, vllm_model)
 
-        eval_sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True)
+        if (grpo_step + 1) % 20 == 0:
+            model.eval()
+            # Load policy into vLLM instance
+            load_policy_into_vllm_instance(model, vllm_model)
 
-        eval_results = log_generations(
-            model=model,
-            tokenizer=tokenizer,
-            llm=vllm_model,
-            step=step,
-            prompts=eval_prompts,
-            answers=eval_answers,
-            eval_sampling_params=eval_sampling_params,
-            train_device=train_device,
-            log_dir=configs.log_dir
-        )
-        
-        print(f"Step {step}, Evaluation Accuracy: {eval_results['accuracy']:.4f}, Avg Response Len: {eval_results['avg_response_len']:.4f}")
-        # wandb.log({"eval/accuracy": eval_results['accuracy'], 
-        #            "eval/format_accuracy": eval_results['format_accuracy'], 
-        #            "eval/answer_accuracy": eval_results['answer_accuracy'], 
-        #            "eval/avg_response_len": eval_results['avg_response_len'], 
-        #            "eval/avg_correct_len": eval_results['avg_correct_len'], 
-        #            "eval/avg_incorrect_len": eval_results['avg_incorrect_len']}, 
-        #            step=step)
+            eval_sampling_params = SamplingParams(temperature=1.0, 
+                                                top_p=1.0, 
+                                                min_tokens=4,
+                                                max_tokens=1024, 
+                                                stop=["</answer>"], 
+                                                include_stop_str_in_output=True,
+                                                )
 
-        # Save model checkpoint at the end of each epoch
-        if configs.save_dir:
-            step_save_path = os.path.join(configs.save_dir, f'checkpoint_grpo_step_{grpo_step}')
-            print(f"\nSaving model checkpoint to {step_save_path}")
-            model.save_pretrained(step_save_path)
-            tokenizer.save_pretrained(step_save_path)
+            eval_results = log_generations(
+                name="grpo",
+                model=model,
+                tokenizer=tokenizer,
+                llm=vllm_model,
+                step=step,
+                prompts=eval_prompts,
+                answers=eval_answers,
+                eval_sampling_params=eval_sampling_params,
+                train_device=train_device,
+                log_dir=configs.log_dir
+            )
+            
+            print(f"Step {step}, Evaluation Accuracy: {eval_results['accuracy']:.4f}, Avg Response Len: {eval_results['avg_response_len']:.4f}")
+            # wandb.log({"eval/accuracy": eval_results['accuracy'], 
+            #            "eval/format_accuracy": eval_results['format_accuracy'], 
+            #            "eval/answer_accuracy": eval_results['answer_accuracy'], 
+            #            "eval/avg_response_len": eval_results['avg_response_len'], 
+            #            "eval/avg_correct_len": eval_results['avg_correct_len'], 
+            #            "eval/avg_incorrect_len": eval_results['avg_incorrect_len']}, 
+            #            step=step)
+
+            # Save model checkpoint at the end of each epoch
+            if configs.save_dir:
+                step_save_path = os.path.join(configs.save_dir, f'checkpoint_grpo_step_{grpo_step}')
+                print(f"\nSaving model checkpoint to {step_save_path}")
+                model.save_pretrained(step_save_path)
+                tokenizer.save_pretrained(step_save_path)
+
+if __name__ == '__main__':
+    parser = TrlParser(GRPOConfig)
+    (configs,) = parser.parse_args_and_config()
+    train_grpo(configs) 

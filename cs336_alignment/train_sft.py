@@ -18,7 +18,8 @@ from cs336_alignment.helpers import (
 from vllm import SamplingParams
 from cs336_alignment.evaluate_math import load_MATH_eval
 import wandb
-from omegaconf import OmegaConf
+from cs336_alignment.sft_config import SFTConfig
+from trl import TrlParser
 
 def sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -114,10 +115,8 @@ def train_sft(configs):
     optimizer = AdamW(model.parameters(), lr=configs.lr)
     num_training_steps = configs.num_epochs * len(train_dataloader)
     
-    lr_scheduler_kwargs = OmegaConf.to_container(configs.lr_scheduler_kwargs, resolve=True) if hasattr(configs, 'lr_scheduler_kwargs') else {}
-
     lr_scheduler = get_scheduler(
-        name=configs.lr_scheduler, optimizer=optimizer, num_warmup_steps=0.05*num_training_steps, num_training_steps=num_training_steps, scheduler_specific_kwargs=lr_scheduler_kwargs
+        name=configs.lr_scheduler, optimizer=optimizer, num_warmup_steps=0.05*num_training_steps, num_training_steps=num_training_steps, scheduler_specific_kwargs=configs.lr_scheduler_kwargs
     )
     
     # Initialize vLLM for evaluation
@@ -186,6 +185,7 @@ def train_sft(configs):
         eval_sampling_params = SamplingParams(temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True)
 
         eval_results = log_generations(
+            name="sft",
             model=model,
             tokenizer=tokenizer,
             llm=llm_eval,
@@ -215,11 +215,8 @@ def train_sft(configs):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train a model with Supervised Fine-Tuning from a config file.")
-    parser.add_argument('--config', type=str, default="cs336_alignment/configs/sft_config.yaml", help='Path to the YAML config file.')
-    args = parser.parse_args()
-    configs = OmegaConf.load(args.config)
-    
+    parser = TrlParser(SFTConfig)
+    (configs,) = parser.parse_args_and_config()
     train_sft(configs)
 
 
