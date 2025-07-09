@@ -12,10 +12,11 @@ from cs336_alignment.helpers import (
     masked_normalize,
     log_generations,
     init_vllm,
-    load_policy_into_vllm_instance
+    load_policy_into_vllm_instance,
+    set_seed
 )
 from vllm import SamplingParams
-from cs336_alignment.evaluate_math import load_MATH
+from cs336_alignment.evaluate_math import load_MATH_eval
 import wandb
 from omegaconf import OmegaConf
 
@@ -78,7 +79,7 @@ def train_sft(configs):
     )
 
     # Set seed for reproducibility
-    torch.manual_seed(configs.seed)
+    set_seed(configs.seed)
     
     # Setup device
     train_device = torch.device(configs.train_device)
@@ -99,7 +100,7 @@ def train_sft(configs):
     # Load datasets
     print("Loading datasets...")
     train_dataset = MATH_SFT_Dataset(configs.data_train_path)
-    eval_questions, eval_answers = load_MATH(configs.data_eval_path)
+    eval_questions, eval_answers = load_MATH_eval(configs.data_eval_path)
 
     micro_batch_size = configs.batch_size // configs.gradient_accumulation_steps
     train_dataloader = DataLoader(train_dataset, batch_size=micro_batch_size, shuffle=True, collate_fn=collate_fn)

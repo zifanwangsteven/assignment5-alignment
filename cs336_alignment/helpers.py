@@ -2,6 +2,8 @@ import os
 import json
 import torch
 from tqdm import tqdm
+import random
+import numpy as np
 import collections
 from typing import List, Callable, Literal
 from transformers import PreTrainedTokenizer, PreTrainedModel
@@ -433,3 +435,11 @@ def masked_mean(
     processed_tensor = tensor * mask
     sum = torch.sum(processed_tensor, dim=dim)
     return sum / mask.sum(dim=dim)
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False

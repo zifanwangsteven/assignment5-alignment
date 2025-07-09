@@ -69,7 +69,7 @@ def compute_metrics(results: List[dict], save_dir: str = None):
         "incorrect_examples": incorrect_examples
     }
 
-def load_MATH(data_path="data/MATH/validation.jsonl"):
+def load_MATH_eval(data_path="data/MATH/validation.jsonl"):
     """
     Load MATH dataset problems and solutions from JSON files.
     
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     )
     
     if args.dataset == "MATH":
-        questions, answers = load_MATH(args.MATH_data_path)
+        questions, answers = load_MATH_eval(args.MATH_data_path)
     elif args.dataset == "gsm8k":
         questions, answers = load_gsm8k(args.gsm8k_data_path)
     else:

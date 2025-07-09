@@ -1,0 +1,34 @@
+# Random seed for reproducibility
+seed: 42
+
+# Device settings
+train_device: "cuda:0"       # GPU for policy training
+eval_device: "cuda:1"        # GPU for vLLM inference
+
+# Paths for model, datasets, and prompt template
+model_path: "models/Qwen2.5-Math-1.5B"
+train_dataset_path: "data/MATH/train.jsonl"
+data_eval_path: "data/MATH/validation.jsonl"
+prompt_template_path: "/path/to/prompt_template.txt"
+
+# Logging and checkpoint directories
+log_dir: "./logs"            # where to write WandB logs or other logs
+save_dir: "./checkpoints"    # where to save model checkpoints
+
+# GRPO training hyperparameters
+train_batch_size: 256                # total batch size for training updates
+gradient_accumulation_steps: 128     # number of micro‐batches to accumulate
+rollout_batch_size: 256              # number of samples generated per GRPO step
+group_size: 8                        # number of completions per prompt in each group
+
+# Optimization settings
+lr: 1e-5                             # learning rate for AdamW
+num_warmup_steps: 100                # number of LR warmup steps
+n_grpo_steps: 200                    # total GRPO steps (rollout → update loops)
+n_grpo_iterations: 1                 # inner on‐policy/off‐policy update iterations per rollout
+
+# Reward and loss configuration
+reward_type: "r1_zero"               # which reward function to use: r1_zero or question_only
+normalize_std: true                  # whether to standardize group rewards by their std
+loss_type: "reinforce_with_baseline" # "no_baseline", "reinforce_with_baseline", or "grpo_clip"
+cliprange: 0.2                       # PPO‐clip range (only used if loss_type == "grpo_clip")
