@@ -3,6 +3,7 @@ models/
 checkpoints/
 logs/
 wandb/
+eval/
 
 nav
 tags
