@@ -30,7 +30,7 @@ def run_tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    from cs336_alignment.helpers import tokenize_prompt_and_output
+    from cs336_alignment.utils import tokenize_prompt_and_output   
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer, device)
 
