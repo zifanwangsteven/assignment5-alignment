@@ -19,6 +19,7 @@ dependencies = [
     "vllm==0.7.2",
     "wandb>=0.19.8",
     "xopen>=2.0.2",
+    "rich>=14.0.0",
 ]
 
 [tool.setuptools.packages.find]

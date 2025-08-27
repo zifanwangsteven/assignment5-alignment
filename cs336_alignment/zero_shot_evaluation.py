@@ -1,22 +1,11 @@
 from vllm import LLM, SamplingParams
 from typing import Callable
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.utils import load_prompt_template, load_prompts
 import torch
 import pandas as pd
 import json
 
-
-def load_prompts(path: str) -> list[dict]:
-    data = []
-    with open(path, "r") as file:
-        for line in file:
-            data.append(json.loads(line.strip()))
-    return data
-
-def load_prompt_template(path: str) -> str:
-    with open(path, "r") as file:
-        prompt = file.read()
-    return prompt
 
 def load_model(model: str, device: str = "cuda:0", gpu_memory_utilization: float=0.85) -> LLM:
     llm = LLM(

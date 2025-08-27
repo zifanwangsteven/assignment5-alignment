@@ -84,7 +84,7 @@ def run_compute_group_normalized_rewards(
 
 def run_compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Get the entropy of the logits (i.e., entropy of the final dimension)."""
-    from cs336_alignment.helpers import compute_entropy
+    from cs336_alignment.utils import compute_entropy
     return compute_entropy(logits)
 
 
@@ -117,7 +117,7 @@ def run_get_response_log_probs(
                 we have not masked out the token indices corresponding to the prompt
                 or padding; that is done in the train loop.
     """
-    from cs336_alignment.helpers import get_response_log_probs
+    from cs336_alignment.utils import get_response_log_probs
     return get_response_log_probs(model, input_ids, labels, return_token_entropy)
 
 
@@ -211,7 +211,7 @@ def run_sft_microbatch_train_step(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
     """
-    from cs336_alignment.train_sft import sft_microbatch_train_step
+    from cs336_alignment.utils import sft_microbatch_train_step
     return sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps, normalize_constant)
 
     
@@ -277,7 +277,7 @@ def run_masked_normalize(
         torch.Tensor, the normalized sum, where masked elements
             (mask=0) don't contribute to the sum.
     """
-    from cs336_alignment.helpers import masked_normalize
+    from cs336_alignment.utils import masked_normalize
     return masked_normalize(tensor, mask, normalize_constant, dim)
 
 
