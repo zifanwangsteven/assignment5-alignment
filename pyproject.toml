@@ -20,6 +20,7 @@ dependencies = [
     "wandb>=0.19.8",
     "xopen>=2.0.2",
     "rich>=14.0.0",
+    "black>=25.1.0",
 ]
 
 [tool.setuptools.packages.find]
